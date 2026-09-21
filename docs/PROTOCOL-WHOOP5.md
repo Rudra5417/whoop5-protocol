@@ -114,17 +114,58 @@ Every `fd4b` operation needs an **encrypted, bonded** link. Without it:
 - writing `fd4b0002` → GATT "Insufficient Authentication"
 - an unbonded command write returns `0x26` with error code `0x049c` (1180)
 
-On Apple platforms, writing a frame to `fd4b0002` **with response** brings up the
-just-works bond before subscriptions are attempted. Sequence that works:
+On Apple platforms many sources report that writing a frame to `fd4b0002` **with
+response** brings up the just-works bond before subscriptions are attempted. See the
+correction below: that was **not** reproduced on iOS with the strap used here.
+Sequence attempted:
 
 1. `writeValue(CLIENT_HELLO, for: fd4b0002, type: .withResponse)`
 2. subscribe `fd4b0003`, `fd4b0004`, `fd4b0005`, `fd4b0007`
 3. strap replies with two `COMMAND_RESPONSE` (GET_HELLO, cmd 145) frames carrying
    device serial and a session token
 
-A static `CLIENT_HELLO` frame is documented by multiple sources as sufficient. The
-exact constant must be confirmed against our own strap capture before being relied on —
-sources disagree on the middle bytes.
+A static `CLIENT_HELLO` frame is documented by multiple sources as sufficient, and
+several projects claim that a confirmed write to `fd4b0002` makes the platform bring
+up the bond automatically.
+
+### Correction from direct observation (iOS, firmware 50.42.1.0)
+
+That claim does **not** hold on iOS, and the GATT table explains why. Enumerating the
+custom service on a real 5.0 gives:
+
+| Characteristic | Properties | dir |
+| --- | --- | --- |
+| `fd4b0002` | write, writeWithoutResponse | app → strap |
+| `fd4b0003` | notify | strap → app |
+| `fd4b0004` | notify | strap → app |
+| `fd4b0005` | notify | strap → app |
+| `fd4b0007` | notify | strap → app |
+
+**There is no readable characteristic on the WHOOP service.** iOS begins BLE pairing
+only as a side effect of *reading* an encrypted value, so a third-party app has no
+trigger to initiate pairing, and every command write fails with:
+
+```
+command_write: Encryption is insufficient.        (CoreBluetooth, code 15)
+command_write: Authentication is insufficient.    (code 5)
+```
+
+Retrying does not help — measured over ~9 connection cycles, 184 of 194 command writes
+failed identically while the underlying bond was never created.
+
+**Consequence:** on iOS the bond must already exist, created by the official WHOOP app
+(the OS-level bond is then shared with every app on that phone). This is why
+`Asherlc/dofek` works by "iOS piggybacking on WHOOP app" and discovering the strap via
+`retrieveConnectedPeripherals(withServices:)`.
+
+**Any client that intends to command a 5.0 on iOS must plan around this**: it cannot
+self-bond, and must either reuse the official app's bond or drive the strap from a
+platform that permits programmatic pairing (Linux/BlueZ and Windows can pair directly,
+as `whoop-vault` and the `bleak`-based projects do).
+
+Once the bond exists, the same observation showed the strap behaving exactly as
+documented: `GET_HELLO` (0x91) answered with `0x24` status `01`, 94 `0x28` live records
+decoded to plausible heart rate and R-R intervals, and notify subscriptions accepted.
 
 ## Live data — REALTIME_DATA 0x28, compact 24-byte form (record type 2)
 

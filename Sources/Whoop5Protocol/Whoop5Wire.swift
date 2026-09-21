@@ -74,10 +74,14 @@ public enum Whoop5Wire {
     }
 
     /// Build a command frame: header + [type][seq][command][params…] + CRC32 trailer.
+    ///
+    /// Format-1 acceptance requires the body to be a multiple of four bytes, so the body
+    /// is zero-padded before the CRC is computed (the CRC covers the padding too), and
+    /// the declared length is the padded size plus the four-byte trailer.
     public static func command(_ command: UInt8, sequence: UInt8, payload: [UInt8] = []) -> Data {
         var body: [UInt8] = [0x23, sequence, command] + payload
-        let trailer = crc32IEEE(body)
-        body += littleEndian32(trailer)
+        while body.count % 4 != 0 { body.append(0x00) }
+        body += littleEndian32(crc32IEEE(body))
         return wrap(body)
     }
 
@@ -132,21 +136,26 @@ public enum Whoop5Wire {
 
     // MARK: - Records
 
-    /// Compact REALTIME_DATA (type 0x28, record type 2, 24-byte payload).
+    /// Compact REALTIME_DATA (type 0x28, record type 2).
     /// Streams about once a second, including outside sync sessions.
+    ///
+    /// Accepts either the full 24-byte payload (with CRC32 trailer) or the 20 command
+    /// bytes that `Frame.packet` yields — only offsets 0…11 are read.
     public struct Realtime: Sendable {
         public let timestamp: Double
         public let heartRate: Int
-        public let valid: Bool
+        /// Raw flag byte. Non-zero means a valid reading: `1` is HR + R-R,
+        /// `2` is HR + R-R plus an extra field.
+        public let flag: UInt8
+        public var valid: Bool { flag != 0 }
         public let rrMilliseconds: Int
 
-        /// - Parameter packet: payload bytes including the CRC32 trailer.
         public init?(packet: [UInt8]) {
-            guard packet.count >= 24, packet[0] == 0x28, packet[1] == 0x02 else { return nil }
+            guard packet.count >= 20, packet[0] == 0x28, packet[1] == 0x02 else { return nil }
             // Timestamp sits at offset 2 here, unlike other packet types.
             timestamp = Double(littleEndian32(packet, 2))
             heartRate = Int(packet[8])
-            valid = packet[9] == 0x01
+            flag = packet[9]
             rrMilliseconds = Int(littleEndian16(packet, 10))
         }
     }
@@ -181,4 +190,30 @@ public enum Whoop5Wire {
 
     /// Extended battery response (command 0x62) is not yet decoded; the standard
     /// 2A19 characteristic remains the reliable battery source.
+}
+
+/// Reassembles the 8-byte-header frame stream on the 5.0 notify channels.
+/// The 4.0 reassembler validates a CRC8 header and cannot be reused here.
+public struct Whoop5Reassembler {
+    private var buffer: [UInt8] = []
+    public private(set) var discardedBytes = 0
+    public init() {}
+    public var pendingBytes: Int { buffer.count }
+
+    public mutating func append(_ bytes: Data) -> [Data] {
+        buffer.append(contentsOf: bytes)
+        var result: [Data] = []
+        while buffer.count >= 8 {
+            guard buffer[0] == 0xAA else { buffer.removeFirst(); discardedBytes += 1; continue }
+            let total = Int(Whoop5Wire.littleEndian16(buffer, 2)) + 8
+            guard total >= 12, total <= 16384,
+                  Whoop5Wire.crc16Modbus(Array(buffer[0..<6])) == Whoop5Wire.littleEndian16(buffer, 6) else {
+                buffer.removeFirst(); discardedBytes += 1; continue
+            }
+            guard buffer.count >= total else { break }
+            result.append(Data(buffer.prefix(total)))
+            buffer.removeFirst(total)
+        }
+        return result
+    }
 }

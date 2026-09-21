@@ -151,6 +151,156 @@ final class Whoop5WireTests: XCTestCase {
         XCTAssertNil(Whoop5Wire.HistoricalRecord(packet: packet))
     }
 
+    // MARK: Regression — real frames captured from a live WHOOP 5.0 (firmware 50.42.1.0)
+
+    /// Full 24-byte payloads taken verbatim from a live session on the author's strap:
+    /// four consecutive ~1 Hz REALTIME_DATA records.
+    private static let realRealtimePayloads = [
+        "28021070b06a0a375102c402bf020000000001003ce5fab7",
+        "28021170b06a0a375101c4020000000000000100fee00359",
+        "28021270b06a0a375201cf0200000000000001009b14fb3c",
+        "28021370b06a0a375302b9028e020000000001000afb97fb",
+    ]
+
+    private func hexBytes(_ hex: String) -> [UInt8]? {
+        let chars = Array(hex)
+        guard chars.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        for i in stride(from: 0, to: chars.count, by: 2) {
+            guard let byte = UInt8(String(chars[i...i + 1]), radix: 16) else { return nil }
+            bytes.append(byte)
+        }
+        return bytes
+    }
+
+    func testRealCapturedFramesDecodeToTheValuesObservedOnHardware() throws {
+        // (timestamp, heart rate, raw flag, R-R ms) exactly as received.
+        // 1_789_947_920 = 2026-09-20 23:45:20 UTC, the moment of capture.
+        let expected: [(Double, Int, UInt8, Int)] = [
+            (1_789_947_920, 81, 2, 708),
+            (1_789_947_921, 81, 1, 708),
+            (1_789_947_922, 82, 1, 719),
+            (1_789_947_923, 83, 2, 697),
+        ]
+        for (hex, want) in zip(Self.realRealtimePayloads, expected) {
+            let packet = try XCTUnwrap(hexBytes(hex))
+            let record = try XCTUnwrap(Whoop5Wire.Realtime(packet: packet), hex)
+            XCTAssertEqual(record.timestamp, want.0, hex)
+            XCTAssertEqual(record.heartRate, want.1, hex)
+            XCTAssertEqual(record.flag, want.2, hex)
+            XCTAssertEqual(record.rrMilliseconds, want.3, hex)
+            // Flag 2 also means a valid reading (HR + R-R + an extra field), not just flag 1.
+            XCTAssertTrue(record.valid, "flag \(record.flag) must count as valid")
+        }
+    }
+
+    func testRealFrameSurvivesCRCValidationAndItsCommandBytesStillDecode() throws {
+        // Wrap the captured payload in the header the strap actually sent, so this
+        // exercises the real parse path rather than a hand-built packet.
+        let payload = try XCTUnwrap(hexBytes(Self.realRealtimePayloads[0]))
+        let head: [UInt8] = [0xAA, 0x01] + Whoop5Wire.littleEndian16(UInt16(payload.count)) + [0x00, 0x01]
+        let frame = try Whoop5Wire.Frame(Data(head + Whoop5Wire.littleEndian16(Whoop5Wire.crc16Modbus(head)) + payload))
+        XCTAssertEqual(frame.type, 0x28)
+        // Frame.packet deliberately excludes the 4-byte CRC32 trailer. An earlier
+        // revision required 24 bytes here and silently decoded nothing.
+        XCTAssertEqual(frame.packet.count, 20)
+        let record = try XCTUnwrap(Whoop5Wire.Realtime(packet: frame.packet))
+        XCTAssertEqual(record.heartRate, 81)
+        XCTAssertEqual(record.rrMilliseconds, 708)
+        XCTAssertEqual(record.timestamp, 1_789_947_920)
+    }
+
+    func testRealtimeRejectsPayloadsTooShortToHoldTheFields() throws {
+        // 19 bytes cannot reach the R-R pair at offset 10–11.
+        let full = try XCTUnwrap(hexBytes(Self.realRealtimePayloads[0]))
+        XCTAssertNil(Whoop5Wire.Realtime(packet: Array(full.prefix(19))))
+    }
+
+    /// The reassembler must split a concatenated stream of captured frames exactly.
+    func testReassemblerSplitsRealBackToBackFrames() throws {
+        var stream: [UInt8] = []
+        for hex in Self.realRealtimePayloads {
+            let payload = try XCTUnwrap(hexBytes(hex))
+            let head: [UInt8] = [0xAA, 0x01] + Whoop5Wire.littleEndian16(UInt16(payload.count)) + [0x00, 0x01]
+            stream += head + Whoop5Wire.littleEndian16(Whoop5Wire.crc16Modbus(head)) + payload
+        }
+        var reassembler = Whoop5Reassembler()
+        let frames = reassembler.append(Data(stream))
+        XCTAssertEqual(frames.count, Self.realRealtimePayloads.count)
+        XCTAssertEqual(reassembler.discardedBytes, 0)
+        XCTAssertEqual(reassembler.pendingBytes, 0)
+        let rates = frames.compactMap { try? Whoop5Wire.Frame($0) }
+            .compactMap { Whoop5Wire.Realtime(packet: $0.packet)?.heartRate }
+        XCTAssertEqual(rates, [81, 81, 82, 83])
+    }
+
+    // MARK: CLIENT_HELLO — the session opener (published frame, verified against our CRCs)
+
+    /// The published CLIENT_HELLO frame from community documentation. Reproducing it
+    /// byte-for-byte proves the encoder matches what the strap expects — including the
+    /// `0x01` parameter byte, which the strap requires and silently ignores if it is `0x00`.
+    func testEncoderReproducesThePublishedClientHelloFrame() {
+        let expected: [UInt8] = [0xaa, 0x01, 0x08, 0x00, 0x00, 0x01, 0xe6, 0x71,
+                                 0x23, 0x01, 0x91, 0x01, 0x36, 0x3e, 0x5c, 0x8d]
+        let built = Whoop5Wire.command(Whoop5Wire.Command.getHello.rawValue,
+                                       sequence: 0x01, payload: [0x01])
+        XCTAssertEqual([UInt8](built), expected)
+    }
+
+    func testClientHelloDecodesToTheDocumentedFields() throws {
+        let packet = try XCTUnwrap(hexBytes("aa0108000001e67123019101363e5c8d"))
+        let frame = try Whoop5Wire.Frame(Data(packet))
+        XCTAssertEqual(frame.type, 0x23)
+        XCTAssertEqual(frame.role1, 0x00)
+        XCTAssertEqual(frame.role2, 0x01)
+        XCTAssertEqual(Array(frame.packet), [0x23, 0x01, 0x91, 0x01])
+    }
+
+    func testZeroParameterHelloIsStructurallyValidButDifferent() throws {
+        // A zero parameter still yields a parseable frame — which is exactly why this
+        // was silent: the strap accepted the write and simply ignored it.
+        let withZero = Whoop5Wire.command(Whoop5Wire.Command.getHello.rawValue,
+                                          sequence: 0x01, payload: [0x00])
+        let withOne = Whoop5Wire.command(Whoop5Wire.Command.getHello.rawValue,
+                                         sequence: 0x01, payload: [0x01])
+        XCTAssertNotEqual(withZero, withOne)
+        XCTAssertEqual(try Whoop5Wire.Frame(withZero).type, 0x23)
+        XCTAssertEqual(try Whoop5Wire.Frame(withOne).type, 0x23)
+        XCTAssertEqual(Array(try Whoop5Wire.Frame(withZero).packet), [0x23, 0x01, 0x91, 0x00])
+    }
+
+    // MARK: Format-1 padding constraint
+
+    func testCommandBodyIsPaddedToAFourByteBoundary() throws {
+        // Format-1 acceptance requires (declaredLength - 4) to be divisible by four, and
+        // a complete frame longer than 15 bytes. A zero-payload command therefore gains a
+        // padding byte, and the CRC is computed over the padded body.
+        let bare = Whoop5Wire.command(Whoop5Wire.Command.linkValid.rawValue, sequence: 0x01)
+        let frame = try Whoop5Wire.Frame(bare)
+        XCTAssertEqual(frame.packet.count % 4, 0)
+        XCTAssertEqual(Array(frame.packet), [0x23, 0x01, 0x01, 0x00])
+        XCTAssertEqual([UInt8](bare).count, 16, "complete frame must exceed 15 bytes")
+    }
+
+    func testFourByteBodiesAreNotPadded() throws {
+        // GET_HELLO already carries a parameter, so it must stay exactly 4 bytes and keep
+        // matching the published CLIENT_HELLO frame.
+        let frame = try Whoop5Wire.Frame(Whoop5Wire.command(Whoop5Wire.Command.getHello.rawValue,
+                                                            sequence: 0x01, payload: [0x01]))
+        XCTAssertEqual(Array(frame.packet), [0x23, 0x01, 0x91, 0x01])
+    }
+
+    func testEveryPaddedBodyIsAccepted() throws {
+        // Padding must hold for the odd payload lengths the app actually sends.
+        for extra in 0...5 {
+            let command = Whoop5Wire.command(Whoop5Wire.Command.setFFValue.rawValue, sequence: 0x09,
+                                             payload: Array(repeating: 0x41, count: extra))
+            let frame = try Whoop5Wire.Frame(command)
+            XCTAssertEqual(frame.packet.count % 4, 0, "payload of \(extra) produced an unaligned body")
+            XCTAssertGreaterThan([UInt8](command).count, 15)
+        }
+    }
+
     // MARK: Endianness helpers
 
     func testLittleEndianHelpers() {
