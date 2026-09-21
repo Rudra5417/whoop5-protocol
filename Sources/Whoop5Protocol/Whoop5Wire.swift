@@ -124,6 +124,31 @@ public enum Whoop5Wire {
         }
     }
 
+    /// Battery percentage from a `GET_BATTERY_LEVEL` (`0x1A`) response.
+    ///
+    /// Calibrated against a `GET_CLOCK` (`0x0B`) reply whose payload is a known unix
+    /// timestamp, which fixes the payload offset:
+    ///
+    ///     [0x24 type][sequence][command][counter][0x01 status][payload...]
+    ///                                                  ^          ^
+    ///                                                  packet[4]  packet[5]
+    ///
+    /// `packet[4] == 0x01` is the success status and all 30 `0x1A` replies observed on
+    /// hardware carried it. The value is a plain percentage, not tenths: a strap that
+    /// read 45% on the standard `2A19` characteristic answered `0x2D` here, and every
+    /// captured reply fell inside 0...100.
+    ///
+    /// The 4.0 decoder is not reusable — it reads a little-endian `u16` in tenths from a
+    /// differently shaped packet, which is why the 5.0 battery never verified.
+    public static func batteryPercent(packet: [UInt8]) -> Double? {
+        guard packet.count >= 6,
+              packet[0] == 0x24,
+              packet[2] == Command.getBatteryLevel.rawValue,
+              packet[4] == 0x01 else { return nil }
+        let percent = Double(packet[5])
+        return (0...100).contains(percent) ? percent : nil
+    }
+
     static func littleEndian16(_ b: [UInt8], _ i: Int) -> UInt16 {
         guard i + 1 < b.count else { return 0 }
         return UInt16(b[i]) | UInt16(b[i + 1]) << 8
@@ -188,8 +213,9 @@ public enum Whoop5Wire {
         }
     }
 
-    /// Extended battery response (command 0x62) is not yet decoded; the standard
-    /// 2A19 characteristic remains the reliable battery source.
+    /// Extended battery response (command 0x62) is not yet decoded. The standard `2A19`
+    /// characteristic and the `0x1A` reply decoded by `batteryPercent(packet:)` are both
+    /// verified on hardware, and they cross-check against each other.
 }
 
 /// Reassembles the 8-byte-header frame stream on the 5.0 notify channels.

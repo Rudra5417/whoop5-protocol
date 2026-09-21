@@ -99,6 +99,9 @@ Anything that only swaps UUIDs will connect, discover services, and then stall f
   check
 - **`DeviceFamily`** — 4.0/5.0 UUID sets, role mapping for the setup gate, and
   auto-detection from discovered services, so one client can support both generations
+- **`batteryPercent(packet:)`** — the `GET_BATTERY_LEVEL` (`0x1A`) reply. The payload offset
+  is calibrated against a `GET_CLOCK` reply, and it cross-checks against the standard `2A19`
+  characteristic on hardware: both reported 41% and 45% at the same moments
 - **`Command`** — the command numbers shared with the 4.0 vocabulary
 
 Not implemented: GATT transport and bonding (platform-specific), the historical offload
@@ -194,9 +197,13 @@ Still open:
 
 1. Whether `TOGGLE_REALTIME_HR` (`0x03`) or `TOGGLE_GENERIC_HR_PROFILE` (`0x0E`) is
    required, or whether the `0x28` stream suffices once bonded
-2. Battery: `2A19` read vs `GET_BATTERY_LEVEL` (`0x1A`) vs
-   `GET_EXTENDED_BATTERY_INFO` (`0x62`) — which the 5.0 answers
-3. Whether the `0x28` flag semantics distinguish "off-wrist" from "no R-R"
+2. How to decode skin temperature and motion from the `0x2F` record, which the analytics
+   need alongside heart rate
+3. Whether `GET_EXTENDED_BATTERY_INFO` (`0x62`) adds anything over `0x1A` — the strap was
+   never observed answering it, while `0x1A` answers reliably
+
+Resolved: the battery question. `2A19` reads *and* a `0x1A` reply both arrive, and they
+agree, so a cross-checked value is available without the standard characteristic.
 
 See [`docs/PROTOCOL-WHOOP5.md`](docs/PROTOCOL-WHOOP5.md) for the full protocol reference,
 including the GATT map, record layouts, and the `SET_FF_VALUE` config keys.

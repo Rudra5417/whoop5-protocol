@@ -301,6 +301,51 @@ final class Whoop5WireTests: XCTestCase {
         }
     }
 
+    // MARK: Battery (verified on hardware)
+
+    /// Two whole frames as received from a worn WHOOP 5.0. At the same moment the strap
+    /// reported 41% and 45% through the standard `2A19` characteristic, which is what
+    /// fixes the payload offset and proves the units are percent, not tenths.
+    func testBatteryPercentDecodesRealCapturedFrames() throws {
+        let cases: [(String, Double)] = [
+            ("aa0110000100208124021a040129000000000000d5a361c3", 41),
+            ("aa01100001002081244a1a02012d000000000000e606bf28", 45),
+        ]
+        for (hex, expected) in cases {
+            // Frame() also validates the header CRC16 and payload CRC32.
+            let frame = try Whoop5Wire.Frame(Data(try XCTUnwrap(hexBytes(hex))))
+            XCTAssertEqual(Whoop5Wire.batteryPercent(packet: frame.packet), expected,
+                           "failed to decode \(hex)")
+        }
+    }
+
+    func testBatteryPercentRejectsAnythingButASuccessfulBatteryReply() throws {
+        let whole = try XCTUnwrap(hexBytes("aa01100001002081244a1a02012d000000000000e606bf28"))
+        let packet = Array(whole[8...])
+        XCTAssertEqual(Whoop5Wire.batteryPercent(packet: packet), 45)
+
+        var wrongStatus = packet; wrongStatus[4] = 0x00
+        XCTAssertNil(Whoop5Wire.batteryPercent(packet: wrongStatus), "a non-success status must not decode")
+
+        var wrongCommand = packet; wrongCommand[2] = 0x0B
+        XCTAssertNil(Whoop5Wire.batteryPercent(packet: wrongCommand), "only 0x1A carries a battery value")
+
+        var wrongType = packet; wrongType[0] = 0x28
+        XCTAssertNil(Whoop5Wire.batteryPercent(packet: wrongType), "only 0x24 responses decode")
+
+        var outOfRange = packet; outOfRange[5] = 200
+        XCTAssertNil(Whoop5Wire.batteryPercent(packet: outOfRange), "200 is not a percentage")
+
+        XCTAssertNil(Whoop5Wire.batteryPercent(packet: [0x24, 0x4a, 0x1a]),
+                     "a truncated packet must not decode")
+    }
+
+    func testBatteryPercentRejectsAClockReply() {
+        // 0x0B shares the status and payload offset but carries a unix timestamp.
+        let packet: [UInt8] = [0x24, 0x4e, 0x0b, 0x07, 0x01, 0x10, 0x70, 0xb0, 0x6a]
+        XCTAssertNil(Whoop5Wire.batteryPercent(packet: packet))
+    }
+
     // MARK: Endianness helpers
 
     func testLittleEndianHelpers() {
