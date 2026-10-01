@@ -5,11 +5,11 @@ copied from these projects, and none of their source may be vendored here (see
 Licensing below). Everything below is a documented observation, not a claim about
 physiological meaning or accuracy.
 
-Baseline firmware: **50.42.1.0** (the user's strap reports exactly this).
+Baseline firmware: **50.42.1.0** (the reference device reports exactly this).
 
 ## Licensing of sources — READ BEFORE COPYING CODE
 
-| Project | License | May we copy code? |
+| Project | License | Reusable? |
 | --- | --- | --- |
 | `Asherlc/dofek` | NOASSERTION ("Other") | No — treat as reference only |
 | `b-nnett/goose` | **none declared** | **No** — all rights reserved |
@@ -17,7 +17,7 @@ Baseline firmware: **50.42.1.0** (the user's strap reports exactly this).
 | `Sophonbot0/whoop-vault` | **MIT** | Yes, with attribution |
 
 Protocol *facts* (UUIDs, byte offsets, CRC parameters, command numbers) are not
-copyrightable. This implementation is written from those facts in our own idiom.
+copyrightable. This implementation is written from those facts independently.
 If whoop-vault (MIT) is ever translated, keep its notice.
 
 ## GATT
@@ -215,7 +215,7 @@ Body = flag name ASCII NUL-padded to 32 bytes, the value byte at offset 32
 (ASCII `'1'`/`'2'`), then 7 zeros. Notable: `enable_r22_packets` opens the
 type-`0x2F` biometric stream. See NOOP's `Whoop5Config` for the ordered set of 16.
 
-## Open questions for our own capture
+## Open questions
 
 1. The exact `CLIENT_HELLO` constant (sources disagree).
 2. Whether `TOGGLE_REALTIME_HR` (0x03) or `TOGGLE_GENERIC_HR_PROFILE` (0x0E) is

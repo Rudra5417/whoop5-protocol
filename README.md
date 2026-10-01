@@ -1,5 +1,9 @@
 # Whoop5Protocol
 
+[![Tests](https://github.com/Rudra5417/whoop5-protocol/actions/workflows/tests.yml/badge.svg)](https://github.com/Rudra5417/whoop5-protocol/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-macOS%2013%2B%20%7C%20iOS%2017%2B-lightgrey.svg)
+
 A Swift implementation of the **WHOOP 5.0 / MG** (`fd4b`) Bluetooth Low Energy protocol.
 It provides the frame envelope, checksum routines, command encoding, and decoders for the
 live and historical biometric records, and is intended to be embedded in a BLE central
