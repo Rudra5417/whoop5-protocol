@@ -69,14 +69,14 @@ final class DeviceFamilyTests: XCTestCase {
         }
     }
 
-    /// The live-setup gate needs these three roles before telemetry starts. If the
-    /// family's role names drifted, the app would sit in "waiting for telemetry".
-    func testEveryFamilyCanSatisfyTheTelemetryGate() {
+    /// The live-setup gate needs these three roles before telemetry starts. If a
+    /// family's role names drifted, a client would stall waiting for telemetry.
+    func testEveryFamilyResolvesTheTelemetryGateRoles() {
         for family in DeviceFamily.allCases {
             let roles = Set([family.responseUUID, family.dataUUID, "2A37"]
                 .compactMap { family.role(forCharacteristicUUID: $0) })
-            XCTAssertTrue(ConnectionRecovery.notificationsReady(roles),
-                          "\(family) cannot satisfy notificationsReady")
+            XCTAssertEqual(roles, ["response", "data", "heartRate"],
+                           "\(family) does not resolve the telemetry gate roles")
         }
     }
 }
