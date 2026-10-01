@@ -1,31 +1,210 @@
 # Whoop5Protocol
 
-A Swift implementation of the **WHOOP 5.0 / MG** ("Maverick/Goose", `fd4b`) Bluetooth Low
-Energy protocol: frame envelope, checksums, command encoding, and decoders for the live
-and historical biometric records.
+A Swift implementation of the **WHOOP 5.0 / MG** (`fd4b`) Bluetooth Low Energy protocol.
+It provides the frame envelope, checksum routines, command encoding, and decoders for the
+live and historical biometric records, and is intended to be embedded in a BLE central
+that already owns its GATT transport.
 
-**Verified against real hardware.** Four consecutive `0x28` records captured live from a
-worn WHOOP 5.0 (firmware `50.42.1.0`) are checked into the test suite, and the encoder
-reproduces a published `CLIENT_HELLO` capture byte-for-byte. See [Verification](#verification).
+The library contains no platform transport code. It is a pure-Foundation package and
+builds for macOS 13+ and iOS 17+.
 
-Written from publicly documented protocol observations. **No third-party source code was
-copied** — see [Provenance and licensing](#provenance-and-licensing).
+## Status
 
-## Three findings that decide whether this works
+| Area | State |
+| --- | --- |
+| Frame codec (encode, parse, reassemble) | Implemented, hardware-verified |
+| Live heart rate (`0x28`) | Implemented, hardware-verified |
+| Historical record (`0x2F`, type 18) | Implemented, partially verified |
+| Battery (`0x1A`) | Implemented, hardware-verified |
+| Device family detection (4.0 / 5.0) | Implemented |
+| GATT transport and bonding | Out of scope (platform-specific) |
+| Historical offload state machine | Not implemented |
+| Optical / SpO₂ decoding | Not implemented |
 
-Getting a WHOOP 5.0 to talk took three separate discoveries. Each fails silently on its
-own, and each is easy to get wrong.
+Hardware verification was performed against a WHOOP 5.0 / MG running firmware
+`50.42.1.0`. Captured frames are committed as test fixtures.
 
-### 1. The command body must be padded to a 4-byte boundary
+## Requirements
 
-Format-1 acceptance requires `(declaredLength − 4)` to be divisible by four, and the
-complete frame to exceed 15 bytes. The CRC32 covers the padding. **Without this the strap
-silently drops the command** — no error, no response. This is the most common reason an
-implementation connects, discovers services, and then appears to do nothing.
+- Swift 5.9 or later
+- macOS 13 or later, or iOS 17 or later
 
-### 2. `CLIENT_HELLO` needs parameter `0x01`
+## Installation
 
-The session opener is `GET_HELLO` (`0x91`) with parameter **`0x01`**, not `0x00`:
+Add the package to `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/Rudra5417/whoop5-protocol.git", from: "1.0.0")
+]
+```
+
+Or add it to an Xcode project via **File → Add Package Dependencies**.
+
+## Usage
+
+### Opening a session
+
+The session opener is `GET_HELLO` (`0x91`) with parameter `0x01`. The write is
+acknowledged by the strap and must be sent before any other command.
+
+```swift
+import Whoop5Protocol
+
+let hello = Whoop5Wire.command(
+    Whoop5Wire.Command.getHello.rawValue,
+    sequence: 1,
+    payload: [0x01]
+)
+peripheral.writeValue(hello, for: characteristic, type: .withResponse)
+```
+
+### Reassembling the notify stream
+
+Notify characteristics deliver an arbitrary byte stream, not discrete frames. Feed each
+notification into a reassembler and parse the frames it yields.
+
+```swift
+var reassembler = Whoop5Reassembler()
+
+func peripheral(_ peripheral: CBPeripheral,
+                didUpdateValueFor characteristic: CBCharacteristic,
+                error: Error?) {
+    guard let data = characteristic.value else { return }
+    for bytes in reassembler.append(data) {
+        guard let frame = try? Whoop5Wire.Frame(bytes) else { continue }
+        handle(frame)
+    }
+}
+```
+
+### Decoding records
+
+```swift
+func handle(_ frame: Whoop5Wire.Frame) {
+    if let live = Whoop5Wire.Realtime(packet: frame.packet) {
+        // ~1 Hz. `valid` reflects the flag byte, not the presence of data.
+        print(live.timestamp, live.heartRate, live.rrMilliseconds, live.valid)
+    } else if let history = Whoop5Wire.HistoricalRecord(packet: frame.packet) {
+        print(history.heartRate, history.rrMilliseconds, history.quaternion ?? [])
+    } else if let percent = Whoop5Wire.batteryPercent(packet: frame.packet) {
+        print(percent)
+    }
+}
+```
+
+`Realtime.valid` reflects the **flag** byte, which reports whether a reading is
+trustworthy rather than whether one arrived. A worn strap reports flag `1` or `2`; an
+off-wrist strap can report a plausible rate with flag `0`. Consumers should treat liveness
+and validity as independent signals: treating a flag-`0` reading as silence causes
+watchdogs to tear down healthy links.
+
+### Detecting the device family
+
+`DeviceFamily` maps the 4.0 and 5.0 UUID sets and resolves characteristic roles, so one
+central can support both generations.
+
+```swift
+let family = DeviceFamily.detect(fromServiceUUIDs: peripheral.services?.map(\.uuid.uuidString) ?? [])
+if family == .whoop5 {
+    // CRC16 header, 8-byte envelope, 4-byte body alignment
+}
+```
+
+## Protocol overview
+
+### Frame envelope
+
+All 5.0 traffic uses an 8-byte header followed by a payload and a CRC32 trailer.
+
+```
+ 0    1     2..3         4      5      6..7      8..n        n+4
++----+----+-----------+------+------+---------+----------+---------+
+| AA | 01 | payloadLen| role1| role2| CRC16   | payload  | CRC32   |
++----+----+-----------+------+------+---------+----------+---------+
+                  u16 LE                     u16 LE     u32 LE
+```
+
+- `payloadLen` **includes** the 4-byte CRC32 trailer, so the payload is `payloadLen - 4`
+  bytes.
+- The header CRC16 covers bytes `0..<6` only.
+- The payload CRC32 covers the payload, excluding the trailer.
+
+### Checksums
+
+| Checksum | Algorithm | Parameters |
+| --- | --- | --- |
+| Header | CRC16-Modbus | reflected polynomial `0xA001`, init `0xFFFF`, no final XOR |
+| Payload | CRC32 IEEE 802.3 / zlib | standard |
+
+### Command encoding
+
+A command body is `[0x23, sequence, command, params…]`, zero-padded to a multiple of four
+bytes. The CRC32 covers the padding and is appended as the trailer; `payloadLen` is the
+padded body size plus four.
+
+```swift
+let frame = Whoop5Wire.command(Whoop5Wire.Command.getClock.rawValue, sequence: 2)
+```
+
+### Response frames
+
+Replies use type `0x24`:
+
+```
+[0x24 type][sequence][command][counter][0x01 status][payload…]
+```
+
+`status == 0x01` indicates success. The payload offset is consistent across commands; it
+is fixed by a `GET_CLOCK` (`0x0B`) reply, whose payload is a little-endian unix timestamp.
+
+### Record layouts
+
+**`0x28` — compact realtime (~1 Hz).** Heart rate, flag, R-R interval, and the record's
+own unix timestamp. Offsets are relative to the packet, which begins after the header.
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | `u8` | packet type (`0x28`) |
+| 1 | `u8` | record version (`0x02`) |
+| 2 | `u32` | unix timestamp, seconds |
+| 8 | `u8` | heart rate, bpm |
+| 9 | `u8` | flag (`0` invalid, `1` HR + R-R, `2` HR + R-R + extra) |
+| 10 | `u16` | R-R interval, milliseconds |
+
+**`0x2F` — historical record, type 18.**
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | `u8` | packet type (`0x2F`) |
+| 1 | `u8` | record type (`0x12`) |
+| 2 | `u16` | sequence |
+| 14 | `u8` | heart rate, bpm |
+| 15 | `u8` | flag |
+| 16 | `u16` | R-R interval, milliseconds |
+| 29 | `u8` | smoothed heart rate |
+| 33..48 | `4 × f32` | orientation quaternion (W, X, Y, Z) |
+
+The quaternion is returned only when it passes a unit-magnitude plausibility check;
+otherwise the field is `nil` and the raw bytes remain available via `Frame.raw`.
+
+## Protocol requirements
+
+Three properties of the protocol are not discoverable by inspection: a frame that violates
+any of them is structurally valid, parses without error, and is silently discarded by the
+strap.
+
+### Body alignment
+
+The command body must be zero-padded to a 4-byte boundary, the CRC32 must cover the
+padding, and the complete frame must exceed 15 bytes. A command that violates this is
+dropped with no error and no response, which typically presents as a client that connects
+and discovers services successfully but never receives data.
+
+### Session opener parameter
+
+`GET_HELLO` must carry parameter `0x01`. A `0x00` parameter produces a frame that parses
+correctly and that the strap ignores.
 
 ```
 aa0108000001e67123019101363e5c8d
@@ -33,180 +212,124 @@ aa0108000001e67123019101363e5c8d
                           ^type ^seq ^cmd ^param
 ```
 
-A `0x00` parameter yields a structurally valid frame that parses cleanly and that the
-strap **ignores**. `testEncoderReproducesThePublishedClientHelloFrame` asserts the exact
-bytes.
+### Bonding on iOS
 
-### 3. On iOS, a third-party app cannot create the bond
-
-The `fd4b` service exposes **no readable characteristic**:
+The `fd4b` service exposes no readable characteristic:
 
 | Characteristic | Properties |
 | --- | --- |
 | `fd4b0002` | write, writeWithoutResponse |
 | `fd4b0003`, `…0004`, `…0005`, `…0007` | notify |
 
-iOS begins BLE pairing only as a side effect of *reading* an encrypted value, so no
-trigger is available. Every command write fails with `Encryption is insufficient` (code
-15), then `Authentication is insufficient` (code 5). Retrying does not help: across ~9
-connection cycles, 184 of 194 writes failed identically while the bond was never created.
+iOS initiates BLE pairing only as a side effect of reading an encrypted value. With no
+readable characteristic on the service, a third-party app has no available trigger, and
+every command write fails with `Encryption is insufficient` (code 15) followed by
+`Authentication is insufficient` (code 5). Retrying within the same connection does not
+create the bond.
 
-**The bond must already exist**, created by the official WHOOP app — its OS-level bond is
-then shared with every app on the phone. Two practical notes from doing this:
+The bond must therefore be created by the official WHOOP app and reused by the OS-level
+bond it establishes. Two constraints apply:
 
-- The strap holds **one** bond. Unpair it **inside the WHOOP app** (Device Settings →
-  Advanced → Unpair). Forgetting it in iOS Settings is not enough, and until it is
-  unpaired the strap will not advertise as pairable at all.
-- To enter pairing mode the strap must be **off the wrist with its green LEDs out**, held
-  **by the sides** (so you don't touch the sensor LEDs), and tapped firmly **5–8 times
-  quickly** until the LED is **blue only**. A green LED means "awake and detecting skin",
-  not "pairable", and is the most common reason pairing appears impossible.
+- **The strap holds a single bond.** It must be unpaired from within the WHOOP app
+  (Device Settings → Advanced → Unpair). Removing it in iOS Settings is insufficient, and
+  until it is unpaired the strap does not advertise as pairable.
+- **Pairing mode requires specific handling.** The strap must be off the wrist with its
+  green LEDs extinguished, held by the sides so the sensor LEDs are not covered, and
+  tapped firmly 5–8 times in quick succession until the LED shows blue only. A green LED
+  indicates skin detection, not pairability, and is the most common cause of apparent
+  pairing failure.
 
-Once the bond exists the strap behaves exactly as documented: `GET_HELLO` returns `0x24`
-status `01`, and the `0x28` stream delivers live heart rate.
+Once the bond exists, `GET_HELLO` returns a `0x24` reply with status `0x01` and the `0x28`
+stream delivers live heart rate.
 
-## Why this exists
+## Compatibility
 
-WHOOP 4.0 and 5.0 are not the same protocol with different UUIDs. They differ in frame
-header length, checksum algorithm, inner record offset, and connection flow:
+WHOOP 4.0 and 5.0 are separate protocols rather than variants of one another.
 
-| | WHOOP 4.0 ("Harvard") | WHOOP 5.0 / MG ("Goose") |
+| | WHOOP 4.0 | WHOOP 5.0 / MG |
 | --- | --- | --- |
 | Custom service | `61080001-8d6d-82b8-614a-1c8cb0f8dcc6` | `fd4b0001-cce1-4033-93ce-002d5875f58a` |
-| Characteristics | `…0002`–`…0005` | `…0002`–`…0005` **plus `…0007`** |
-| Frame header | 5 bytes | **8 bytes** (adds `role1`, `role2`) |
-| Header checksum | CRC8, poly `0x07` | **CRC16-Modbus, poly `0xA001`** |
-| Inner record offset | byte 4 | **byte 8** |
-| Body padding | unpadded | **4-byte aligned** |
+| Characteristics | `…0002`–`…0005` | `…0002`–`…0005` plus `…0007` |
+| Frame header | 5 bytes | 8 bytes (adds `role1`, `role2`) |
+| Header checksum | CRC8, polynomial `0x07` | CRC16-Modbus, polynomial `0xA001` |
+| Inner record offset | byte 4 | byte 8 |
+| Body alignment | unpadded | 4-byte aligned |
 | Session start | confirmed write, then `GET_HELLO_HARVARD` | static `CLIENT_HELLO` |
 
-Anything that only swaps UUIDs will connect, discover services, and then stall forever.
+Substituting UUIDs alone is not sufficient: a client adapted this way connects and
+discovers services, then stalls without producing data. The 4.0 reassembler and battery
+decoder are likewise not reusable, as both validate a different envelope.
 
-## What's implemented
+## Limitations
 
-- **Checksums** — `crc16Modbus` (reflected `0xA001`, init `0xFFFF`) and `crc32IEEE`
-  (zlib/IEEE 802.3), both validated against standard check vectors
-- **Frame codec** — 8-byte header builder and parser, with `payloadLen` that *includes*
-  the 4-byte CRC32 trailer, 4-byte body padding, and strict rejection of truncated,
-  bad-CRC, and bad-SOF input
-- **`Whoop5Reassembler`** — splits the CRC16-headed notify stream into frames. The 4.0
-  reassembler validates a CRC8 header and cannot be reused
-- **`Realtime`** — compact `0x28` record: heart rate, flag, R-R interval, unix timestamp.
-  The ~1 Hz live feed. Accepts the full payload or the 20 command bytes `Frame.packet`
-  yields
-- **`HistoricalRecord`** — `0x2F` record type 18: heart rate, flag, R-R interval, smoothed
-  heart rate, and the orientation quaternion, guarded by a unit-quaternion plausibility
-  check
-- **`DeviceFamily`** — 4.0/5.0 UUID sets, role mapping for the setup gate, and
-  auto-detection from discovered services, so one client can support both generations
-- **`batteryPercent(packet:)`** — the `GET_BATTERY_LEVEL` (`0x1A`) reply. The payload offset
-  is calibrated against a `GET_CLOCK` reply, and it cross-checks against the standard `2A19`
-  characteristic on hardware: both reported 41% and 45% at the same moments
-- **`Command`** — the command numbers shared with the 4.0 vocabulary
+- **Historical offload is not implemented.** Per-second heart rate, skin temperature,
+  motion, gravity, and activity score over multi-week windows require a command sequence
+  that this library does not yet provide.
+- **Skin temperature and motion are not decoded** from the `0x2F` record. Only heart rate,
+  R-R interval, and the orientation quaternion are exposed.
+- **Optical and SpO₂ data are not decoded.** The raw packets are time-multiplexed and no
+  validated offline decoding is available.
+- **GATT transport and bonding are out of scope.** The library operates on bytes; it does
+  not manage connections, pairing, or characteristic discovery.
+- **`GET_EXTENDED_BATTERY_INFO` (`0x62`) is not implemented.** The strap was not observed
+  answering it, whereas `0x1A` responds reliably.
 
-Not implemented: GATT transport and bonding (platform-specific), the historical offload
-state machine, optical/SpO₂ decoding, and firmware update paths.
-
-## Usage
-
-```swift
-import Whoop5Protocol
-
-// Open the session. This confirmed write is also what the strap answers.
-let hello = Whoop5Wire.command(Whoop5Wire.Command.getHello.rawValue,
-                               sequence: 1, payload: [0x01])
-
-// Reassemble the notify stream, then parse each frame
-var reassembler = Whoop5Reassembler()
-for frame in reassembler.append(notificationData) {
-    let parsed = try Whoop5Wire.Frame(frame)
-    if let live = Whoop5Wire.Realtime(packet: parsed.packet) {
-        print(live.heartRate, live.rrMilliseconds, live.valid)
-    }
-}
-```
-
-`Realtime.valid` reflects the **flag** byte — whether the reading is *trustworthy*
-(R-R available). A worn strap reports flag `1`/`2`; an off-wrist strap can still report a
-plausible rate with flag `0`. Treat liveness (data arriving) separately from validity:
-counting a flag-0 reading as silence makes a watchdog tear down a perfectly healthy link.
-
-## Verification
+## Testing
 
 ```sh
-swift test        # 36 tests
+swift test
 ```
 
-Two independent anchors:
+39 tests, anchored on two independent sources.
 
-**1. A published hardware capture.** This frame is rebuilt byte-for-byte, and its header
-CRC16 (`0x41E7`) and payload CRC32 (`0xFC61E958`) asserted directly:
+**Published hardware capture.** The documented `CLIENT_HELLO` frame is reproduced
+byte-for-byte, with its header CRC16 (`0x41E7`) and payload CRC32 (`0xFC61E958`) asserted
+directly:
 
 ```
 aa 01 0c 00 00 01 e7 41 | 23 f1 6a 01 01 00 00 00 | 58 e9 61 fc
 ```
 
-**2. Real frames from a live WHOOP 5.0**, worn on the wrist — four consecutive `0x28`
-records, decoded to the values actually observed:
+**Captured frames.** Four consecutive `0x28` records and two `0x1A` battery replies
+captured from a worn WHOOP 5.0 are committed as fixtures and decoded to the values
+observed on the device:
 
 ```
-28021070b06a0a375102c402bf020000000001003ce5fab7 → ts 1789947920, HR 81, flag 2, R-R 708 ms
-28021170b06a0a375101c4020000000000000100fee00359 → ts 1789947921, HR 81, flag 1, R-R 708 ms
-28021270b06a0a375201cf0200000000000001009b14fb3c → ts 1789947922, HR 82, flag 1, R-R 719 ms
-28021370b06a0a375302b9028e020000000001000afb97fb → ts 1789947923, HR 83, flag 2, R-R 697 ms
+28021070b06a0a375102c402bf020000000001003ce5fab7 -> ts 1789947920, HR 81, flag 2, R-R 708 ms
+28021170b06a0a375101c4020000000000000100fee00359 -> ts 1789947921, HR 81, flag 1, R-R 708 ms
+28021270b06a0a375201cf0200000000000001009b14fb3c -> ts 1789947922, HR 82, flag 1, R-R 719 ms
+28021370b06a0a375302b9028e020000000001000afb97fb -> ts 1789947923, HR 83, flag 2, R-R 697 ms
 ```
 
-If the header CRC, endianness, `payloadLen` semantics, padding, or record offsets were off
-by a single byte, these fail.
+```
+aa0110000100208124021a040129000000000000d5a361c3 -> 41%, status 0x01
+aa01100001002081244a1a02012d000000000000e606bf28 -> 45%, status 0x01
+```
+
+These fixtures exercise the header CRC, endianness, `payloadLen` semantics, body
+alignment, and record offsets simultaneously; an error of a single byte in any of them
+fails the suite. Both battery replies were cross-checked against the standard `2A19`
+characteristic, which reported the same percentages at the same moments.
 
 ## Provenance and licensing
 
-Protocol *facts* — UUIDs, byte offsets, checksum parameters, command numbers — are
-observations, not copyrightable expression. This implementation is written from those
-facts in its own idiom.
+Protocol facts — UUIDs, byte offsets, checksum parameters, and command numbers — are
+observations rather than copyrightable expression, and this implementation is written from
+those facts independently. No third-party source code is vendored.
 
-The sources it draws on are **not** uniformly reusable, and none of their code is
-vendored here:
+The reference projects consulted are not uniformly reusable:
 
-| Project | License | Status |
+| Project | License | Use |
 | --- | --- | --- |
 | `Sophonbot0/whoop-vault` | MIT | Reusable with attribution |
 | `Asherlc/dofek` | NOASSERTION | Reference only |
-| `ryanbr/noop`, `NoopApp/noop` | PolyForm Noncommercial | **Not** compatible with this license |
-| `b-nnett/goose` | none declared | **All rights reserved** — do not copy |
+| `ryanbr/noop`, `NoopApp/noop` | PolyForm Noncommercial | Not compatible with this license |
+| `b-nnett/goose` | None declared | All rights reserved; do not copy |
 
-This repository is licensed **MIT** (see `LICENSE`).
+This repository is licensed under the MIT License. See [`LICENSE`](LICENSE).
 
-## History offload — not yet implemented
-
-The route to full analytics (per-second HR, skin temperature, motion, gravity, activity
-score, over weeks), as documented by `whoop-vault` (MIT):
-
-```
-cmd 96 ENTER_HIGH_FREQ_SYNC
-cmd 22 SEND_HISTORICAL_DATA
-  ← strap streams 0x2F chunks plus METADATA HISTORY_END (type 49, sub 2)
-cmd 23 ACK: [SUCCESS=1, start_id(4), end_id(4)]     (9 bytes, padded to 12)
-```
-
-Without the per-chunk acknowledgement the strap stops after the first chunk. A successful
-acknowledgement can let the strap reclaim history, so records must be committed locally
-**before** acknowledging.
-
-Still open:
-
-1. Whether `TOGGLE_REALTIME_HR` (`0x03`) or `TOGGLE_GENERIC_HR_PROFILE` (`0x0E`) is
-   required, or whether the `0x28` stream suffices once bonded
-2. How to decode skin temperature and motion from the `0x2F` record, which the analytics
-   need alongside heart rate
-3. Whether `GET_EXTENDED_BATTERY_INFO` (`0x62`) adds anything over `0x1A` — the strap was
-   never observed answering it, while `0x1A` answers reliably
-
-Resolved: the battery question. `2A19` reads *and* a `0x1A` reply both arrive, and they
-agree, so a cross-checked value is available without the standard characteristic.
-
-See [`docs/PROTOCOL-WHOOP5.md`](docs/PROTOCOL-WHOOP5.md) for the full protocol reference,
-including the GATT map, record layouts, and the `SET_FF_VALUE` config keys.
+See [`docs/PROTOCOL-WHOOP5.md`](docs/PROTOCOL-WHOOP5.md) for the complete protocol
+reference, including the GATT map, record layouts, and `SET_FF_VALUE` configuration keys.
 
 ## Disclaimer
 
